@@ -37,11 +37,21 @@ async def on_bar_update(ib, contract, opening_range, atr, bars):
     if action != 'hold':
         await place_order(action, contract, 1, atr)  # Adjust quantity as needed 
 
+async def connect_ib():
+    ib = IB()
+    while True:
+        try:
+            ib.connect('127.0.0.1', 7497, clientId=1)
+            print('Connected to Interactive Brokers')
+            return ib
+        except Exception as e:
+            print(f"Connection failed: {e}. Retrying in 5 seconds")
+            await asyncio.sleep(5)
+
 async def main():
 
     # Connect to Interactive Brokers
-    ib = IB()
-    ib.connect('127.0.0.1', 7497, clientId=1)
+    ib = await connect_ib()
 
     # Define the index contract
     # contract = Index('SPX', 'CBOE', 'USD')
@@ -60,74 +70,78 @@ async def main():
     for ticker in sp500_ticks:
         contract = Stock(ticker, 'SMART', 'USD')
 
-        # Fetch historical data for the opening range
-        bars = await ib.reqHistoricalDataAsync(
-            contract,
-            endDateTime='',
-            durationStr='14 D',
-            barSizeSetting='1 day',
-            whatToShow='TRADES',
-            useRTH=True
-        )
-
-        # Convert bars to DataFrame
-        df = pd.DataFrame([bars.__dict__ for bars in bars])
-
-        if df.empty:
-            continue    
-    
-        # Calculate Average True Range (ATR)
-        df['high_low'] = df.high - df.low
-        df['high_close'] = (df.high - df.close.shift()).abs()
-        df['low_close'] = (df.low - df.close.shift()).abs()
-        df['true_range'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
-        df['atr'] = df.true_range.rolling(14).mean()
-        atr = df.atr.iloc[-1]
-
-        # Calculate Average Daily Volume (ADV)
-        average_volume = df.volume.mean()
-
-        # Fetch current day's volume
-        current_day_bars = await ib.reqHistoricalDataAsync(
-            contract,
-            endDateTime='',
-            durationStr='1 D',
-            barSizeSetting='1 day',
-            whatToShow='TRADES',
-            useRTH=True
-        )
-        current_volume = current_day_bars[-1].volume
-
-        # Calculate relative volume (RVOL)
-        relative_volume = current_volume / average_volume
-    
-        # Check if the stock meets the criteria
-        if (df['open'].iloc[-1] > min_price and
-            average_volume > min_adv and
-            atr > min_atr and
-            relative_volume > min_rvol):
-
-            print(f'Stock {ticker} meets the criteria for ORB strategy')
-
+        try:
             # Fetch historical data for the opening range
             bars = await ib.reqHistoricalDataAsync(
                 contract,
                 endDateTime='',
-                durationStr='1 D',
-                barSizeSetting='5 mins',
+                durationStr='14 D',
+                barSizeSetting='1 day',
                 whatToShow='TRADES',
-                useRTH=True
+                useRTH=True,
             )
+
+            # Convert bars to DataFrame
             df = pd.DataFrame([bars.__dict__ for bars in bars])
-            # Fisrt 5 min bar
-            opening_range = df.iloc[:1]
 
-            # Request real-time bars and set up event handler
-            ib.reqRealTimeBars(contract, 5, 'TRADES', False, on_bar_update(ib, contract, opening_range, atr, bars))
-            selected_stocks.append(contract)
-        # else:
-        #     print(f'Stock {ticker} does not meet the criteria for ORB strategy')
+            # if df.empty:
+                # continue    
+        
+            # Calculate Average True Range (ATR)
+            df['high_low'] = df.high - df.low
+            df['high_close'] = (df.high - df.close.shift()).abs()
+            df['low_close'] = (df.low - df.close.shift()).abs()
+            df['true_range'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
+            df['atr'] = df.true_range.rolling(14).mean()
+            atr = df.atr.iloc[-1]
 
+            # Calculate Average Daily Volume (ADV)
+            average_volume = df.volume.mean()
+
+            # Fetch current day's volume
+            current_day_bars = await ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime='',
+                durationStr='1 D',
+                barSizeSetting='1 day',
+                whatToShow='TRADES',
+                useRTH=True,
+            )
+            current_volume = current_day_bars[-1].volume
+
+            # Calculate relative volume (RVOL)
+            relative_volume = current_volume / average_volume
+        
+            # Check if the stock meets the criteria
+            if (df['open'].iloc[-1] > min_price and
+                average_volume > min_adv and
+                atr > min_atr and
+                relative_volume > min_rvol):
+
+                print(f'Stock {ticker} meets the criteria for ORB strategy')
+
+                # Fetch historical data for the opening range
+                bars = await ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime='',
+                    durationStr='1 D',
+                    barSizeSetting='5 mins',
+                    whatToShow='TRADES',
+                    useRTH=True,
+                )
+                df = pd.DataFrame([bars.__dict__ for bars in bars])
+                # Fisrt 5 min bar
+                opening_range = df.iloc[:1]
+
+                # Request real-time bars and set up event handler
+                bars = ib.reqRealTimeBars(contract, 5, 'TRADES', False, [])
+                bars.updateEvent += lambda bars, hasNewBar: asyncio.create_task(on_bar_update(ib, contract, opening_range, atr, bars))
+                selected_stocks.append(contract)
+
+                # Throttle requests to avoid rate-limiting
+                await asyncio.sleep(1)
+        except Exception as e:
+            print(f'Error fetching data for {ticker}: {e}')
     if selected_stocks:
         ib.run()
 
