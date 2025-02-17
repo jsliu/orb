@@ -8,10 +8,9 @@ from ib_async import IB, Stock
 import asyncio
 import nest_asyncio
 import logging
-import pytz
 from backtesting import Backtest, Strategy
-from backtesting.lib import resample_apply
 from backtesting.test import SMA
+from IPython.display import display, HTML  # Add this import
 
 # Ensure plots are displayed inline in Jupyter
 # %matplotlib inline
@@ -63,7 +62,7 @@ async def fetch_historical_data(ticker, duration, bar_size):
 # Define the ORBStrategy class
 class ORBStrategy(Strategy):
     opening_range_minutes = 5
-    atr_multiplier = 1.5
+    atr_multiplier = 0.1
     atr_period_days = 14
 
     def init(self):
@@ -128,12 +127,12 @@ class ORBStrategy(Strategy):
 
         # Monitor prices throughout the day
         if self.buy_signal and self.data.High[-1] > self.first_bar_high:
-            self.buy(size=100)  # Buy 100 shares
+            self.buy(size=10)  # Buy 100 shares
             self.buy_signal = False
             self.stop_loss = self.data.Close[-1] - self.atr[-1] * self.atr_multiplier
         
         if self.sell_signal and self.data.Low[-1] < self.first_bar_low:
-            self.sell(size=100)  # Sell 100 shares
+            self.sell(size=10)  # Sell 100 shares
             self.sell_signal = False
             self.stop_loss = self.data.Close[-1] + self.atr[-1] * self.atr_multiplier
 
@@ -145,7 +144,7 @@ class ORBStrategy(Strategy):
                 self.position.close()  # Close the position
 
         # Close positions at the end of the trading day
-        market_close_time = pd.to_datetime('20:59:00').time()
+        market_close_time = pd.to_datetime('15:59:00').time()
         if self.data.index[-1].time() >= market_close_time:
             if self.position:
                 self.position.close()
@@ -155,26 +154,33 @@ def plot_performance(portfolio_values):
     sns.set_theme(style="darkgrid")
     plt.figure(figsize=(10, 6))
     dates, values = zip(*portfolio_values)
-    sns.lineplot(x=dates, y=values)
+    # Resample to daily frequency
+    df = pd.DataFrame({'Date': dates, 'Value': values})
+    df.set_index('Date', inplace=True)
+    df = df.resample('D').last().dropna()
+    
+    sns.lineplot(x=df.index, y=df['Value'])
     plt.title('Portfolio Performance')
-    plt.xlabel('Time')
+    plt.xlabel('Date')
     plt.ylabel('Portfolio Value')
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
-    plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+    plt.gca().xaxis.set_major_locator(mdates.DayLocator())
     plt.gcf().autofmt_xdate()
     plt.show()
 
 # Function to run the backtest
-def run_backtest(ticker):
+def run_backtest(ticker, cash=100000):
     # Fetch historical data for 1-minute bars
-    df_minute = asyncio.run(fetch_historical_data(ticker, '15 D', '1 min'))
+    df_minute = asyncio.run(fetch_historical_data(ticker, '30 D', '1 min'))
     
     # Align the data to start at the correct time
     # df_minute = df_minute[df_minute.index.time >= pd.to_datetime('09:30:00').time()]
     
     # Run the backtest
-    bt = Backtest(df_minute, ORBStrategy, cash=100000, commission=.001)
+    bt = Backtest(df_minute, ORBStrategy, cash=cash, commission=.001)
     stats = bt.run()
+    
+    # Plot the results
     bt.plot()
 
     # Collect performance data
@@ -186,6 +192,6 @@ def run_backtest(ticker):
 
 # Main entry point
 if __name__ == '__main__':
-    stats = run_backtest('AAPL')
+    stats = run_backtest('ABNB', cash=20000)
 
 # %%
