@@ -1,14 +1,17 @@
 # %%
-import backtrader as bt
 import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
+from matplotlib import dates as mdates  # Add this import
 from ib_async import IB, Stock
-import asyncio  # Import asyncio for asynchronous operations
-import nest_asyncio  # Import nest_asyncio to allow nested event loops
-import matplotlib.dates as mdates  # Import for date formatting
-import logging  # Import logging for debug information
+import asyncio
+import nest_asyncio
+import logging
+import pytz
+from backtesting import Backtest, Strategy
+from backtesting.lib import resample_apply
+from backtesting.test import SMA
 
 # Ensure plots are displayed inline in Jupyter
 # %matplotlib inline
@@ -17,86 +20,7 @@ import logging  # Import logging for debug information
 nest_asyncio.apply()
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
-# logging.basicConfig(level=logging.CRITICAL)  # Set logging level to CRITICAL to disable logging
-
-class ResampledDataObserver(bt.Observer):
-    lines = ('datetime', 'open', 'high', 'low', 'close', 'volume')
-
-    plotinfo = dict(plot=True, subplot=True)
-
-    def next(self):
-        dt = self.data1.datetime.datetime(0)
-        open_ = self.data1.open[0]
-        high = self.data1.high[0]
-        low = self.data1.low[0]
-        close = self.data1.close[0]
-        volume = self.data1.volume[0]
-        print(f"Resampled Data - Date: {dt}, Open: {open_}, High: {high}, Low: {low}, Close: {close}, Volume: {volume}")
-
-# Define a custom analyzer to record portfolio values
-class PortfolioValue(bt.Analyzer):
-    def __init__(self):
-        self.values = []
-
-    def next(self):
-        self.values.append((self.strategy.datetime.datetime(), self.strategy.broker.getvalue()))
-
-# Define the ORBStrategy class
-class ORBStrategy(bt.Strategy):
-    params = (
-        ('opening_range_minutes', 5),  # Opening range in minutes
-        ('atr_multiplier', 1.5),  # ATR multiplier for stop orders
-        ('atr_period_days', 14),  # ATR period for daily data
-    )
-
-    def __init__(self):
-        self.first_bar = None
-        self.first_bar_high = None
-        self.first_bar_low = None
-        self.buy_signal = False
-        self.sell_signal = False
-
-        # Add ATR indicator based on resampled daily data
-        self.atr = bt.indicators.AverageTrueRange(self.data, period=self.params.atr_period_days)
-
-    def next(self):
-        # Log the current data values
-        logging.debug(f"Date: {self.data.datetime.datetime(0)}, Open: {self.data.open[0]}, High: {self.data.high[0]}, Low: {self.data.low[0]}, Close: {self.data.close[0]}, Volume: {self.data.volume[0]}")
-
-        # Check if the current bar is the first bar of the day
-        if self.data.datetime.date(0) != self.data1.datetime.date(-1):
-            self.first_bar = True
-            self.buy_signal = False
-            self.sell_signal = False
-
-        # If it's the first 5-minute bar, record the high and low prices
-        if self.first_bar:
-            self.first_bar = False
-            self.first_bar_high = self.data.high[0]
-            self.first_bar_low = self.data.low[0]
-            if self.data.close[0] > self.data.open[0]:
-                self.buy_signal = True  
-            elif self.data.close[0] < self.data.open[0]:
-                self.sell_signal = True
-
-        # Monitor prices throughout the day
-        if self.buy_signal and self.data.high[0] > self.first_bar_high:
-            self.buy(size=100)  # Buy 100 shares
-            self.buy_signal = False
-            self.stop_loss = self.data.close[0] - self.atr[0] * self.params.atr_multiplier
-        
-        if self.sell_signal and self.data.low[0] < self.first_bar_low:
-            self.sell(size=100)  # Sell 100 shares
-            self.sell_signal = False
-            self.stop_loss = self.data.close[0] + self.atr[0] * self.params.atr_multiplier
-
-        # Implement stop-loss orders
-        if self.position:
-            if self.position.size > 0 and self.data.close[0] < self.stop_loss:
-                self.close()  # Close the position
-            elif self.position.size < 0 and self.data.close[0] > self.stop_loss:
-                self.close()  # Close the position
+logging.basicConfig(level=logging.CRITICAL)  # Set logging level to CRITICAL to disable logging
 
 # Asynchronous function to connect to Interactive Brokers
 async def connect_ib():
@@ -132,8 +56,99 @@ async def fetch_historical_data(ticker, duration, bar_size):
     df['datetime'] = df['datetime'].dt.tz_convert('US/Eastern')
     
     df.set_index('datetime', inplace=True)  # Set the datetime column as the index
-    df = df[['open', 'high', 'low', 'close', 'volume']]  # Ensure the DataFrame has the required columns
+    df = df.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})  # Capitalize column names
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']]  # Ensure the DataFrame has the required columns
     return df
+
+# Define the ORBStrategy class
+class ORBStrategy(Strategy):
+    opening_range_minutes = 5
+    atr_multiplier = 1.5
+    atr_period_days = 14
+
+    def init(self):
+        self.first_bar = None
+        self.first_bar_open = None
+        self.first_bar_close = None
+        self.first_bar_high = None
+        self.first_bar_low = None
+        self.buy_signal = False
+        self.sell_signal = False
+        self.previous_day = None
+
+        # Add ATR indicator based on resampled daily data
+        self.atr = self.I(SMA, self.data.Close, self.atr_period_days)
+
+    def next(self):
+        # Log the current data values
+        logging.debug(f"Date: {self.data.index[-1]}, Open: {self.data.Open[-1]}, High: {self.data.High[-1]}, Low: {self.data.Low[-1]}, Close: {self.data.Close[-1]}, Volume: {self.data.Volume[-1]}")
+
+        if len(self.data) < self.atr_period_days:
+            return 
+        
+        current_date = self.data.index[-1].date()
+
+        # Check if the current bar is the first bar of the day
+        if self.previous_day != current_date:
+            self.previous_day = current_date
+            self.first_range_bar = []
+
+        if len(self.first_range_bar) < self.opening_range_minutes:
+            self.first_range_bar.append({
+                'open': self.data.Open[-1],
+                'high': self.data.High[-1],
+                'low': self.data.Low[-1],
+                'close': self.data.Close[-1],
+                })
+
+        if len(self.first_range_bar) == self.opening_range_minutes:
+            self.first_bar_open = self.first_range_bar[0]['open']
+            self.first_bar_close = self.first_range_bar[-1]['close']
+            self.first_bar_high = max([x['high'] for x in self.first_range_bar])
+            self.first_bar_low = min([x['low'] for x in self.first_range_bar])
+
+            self.first_bar = True
+            self.buy_signal = False
+            self.sell_signal = False
+            
+            if self.first_bar_close > self.first_bar_open:
+                self.buy_signal = True
+            elif self.first_bar_close < self.first_bar_open:
+                self.sell_signal = True        
+
+        # If it's the first 5-minute bar, record the high and low prices
+        if self.first_bar:
+            self.first_bar = False
+            self.first_bar_high = self.data.High[-1]
+            self.first_bar_low = self.data.Low[-1]
+            if self.first_bar_close > self.first_bar_open:
+                self.buy_signal = True  
+            elif self.first_bar_close < self.first_bar_open:
+                self.sell_signal = True
+
+        # Monitor prices throughout the day
+        if self.buy_signal and self.data.High[-1] > self.first_bar_high:
+            self.buy(size=100)  # Buy 100 shares
+            self.buy_signal = False
+            self.stop_loss = self.data.Close[-1] - self.atr[-1] * self.atr_multiplier
+        
+        if self.sell_signal and self.data.Low[-1] < self.first_bar_low:
+            self.sell(size=100)  # Sell 100 shares
+            self.sell_signal = False
+            self.stop_loss = self.data.Close[-1] + self.atr[-1] * self.atr_multiplier
+
+        # Implement stop-loss orders
+        if self.position:
+            if self.position.is_long and self.data.Close[-1] < self.stop_loss:
+                self.position.close()  # Close the position
+            elif self.position.is_short and self.data.Close[-1] > self.stop_loss:
+                self.position.close()  # Close the position
+
+        # Close positions at the end of the trading day
+        market_close_time = pd.to_datetime('20:59:00').time()
+        if self.data.index[-1].time() >= market_close_time:
+            if self.position:
+                self.position.close()
 
 # Function to plot performance using Seaborn
 def plot_performance(portfolio_values):
@@ -151,40 +166,26 @@ def plot_performance(portfolio_values):
 
 # Function to run the backtest
 def run_backtest(ticker):
-    cerebro = bt.Cerebro()
-    cerebro.addstrategy(ORBStrategy)  # Add the ORB strategy
-    cerebro.addanalyzer(PortfolioValue, _name='portfolio_value')  # Add the custom analyzer
-    # cerebro.addobserver(ResampledDataObserver)  # Add the custom observer
-
     # Fetch historical data for 1-minute bars
-    df_minute= asyncio.run(fetch_historical_data(ticker, '30 D', '5 mins'))
+    df_minute = asyncio.run(fetch_historical_data(ticker, '15 D', '1 min'))
     
     # Align the data to start at the correct time
     # df_minute = df_minute[df_minute.index.time >= pd.to_datetime('09:30:00').time()]
     
-    data_minute = bt.feeds.PandasData(dataname=df_minute)  # Convert DataFrame to Backtrader data feed
-    
-    cerebro.adddata(data_minute)  # Add 1-minute data feed to Cerebro
-
-    # Resample the 1-minute data to daily data
-    cerebro.resampledata(data_minute, timeframe=bt.TimeFrame.Days)
-
-    cerebro.broker.setcash(100000.0)  # Set initial cash
-    cerebro.broker.setcommission(commission=0.001)  # Set commission
-
-    print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
-    results = cerebro.run()  # Run the backtest
-    print('Final Portfolio Value: %.2f' % cerebro.broker.getvalue())
+    # Run the backtest
+    bt = Backtest(df_minute, ORBStrategy, cash=100000, commission=.001)
+    stats = bt.run()
+    bt.plot()
 
     # Collect performance data
-    portfolio_values = results[0].analyzers.portfolio_value.values
+    portfolio_values = list(zip(stats['_equity_curve'].index, stats['_equity_curve']['Equity']))
 
     # Plot performance using Seaborn
-    plot_performance(portfolio_values)
-    # cerebro.plot(iplot=True, volume=False)  # Ensure plot is displayed inline
+    # plot_performance(portfolio_values)
+    return stats
 
 # Main entry point
 if __name__ == '__main__':
-    run_backtest('NVDA')  # Run backtest for NVDA ticker
+    stats = run_backtest('AAPL')
 
 # %%
