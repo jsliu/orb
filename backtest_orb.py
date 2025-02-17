@@ -157,17 +157,17 @@ def run_backtest(ticker):
     # cerebro.addobserver(ResampledDataObserver)  # Add the custom observer
 
     # Fetch historical data for 1-minute bars
-    df_1min = asyncio.run(fetch_historical_data(ticker, '30 D', '5 mins'))
+    df_minute= asyncio.run(fetch_historical_data(ticker, '30 D', '5 mins'))
     
     # Align the data to start at the correct time
-    df_min = df_1min[df_1min.index.time >= pd.to_datetime('09:30:00').time()]
+    # df_minute = df_minute[df_minute.index.time >= pd.to_datetime('09:30:00').time()]
     
-    data_min = bt.feeds.PandasData(dataname=df_1min)  # Convert DataFrame to Backtrader data feed
+    data_minute = bt.feeds.PandasData(dataname=df_minute)  # Convert DataFrame to Backtrader data feed
     
-    cerebro.adddata(data_min)  # Add 1-minute data feed to Cerebro
+    cerebro.adddata(data_minute)  # Add 1-minute data feed to Cerebro
 
     # Resample the 1-minute data to daily data
-    cerebro.resampledata(data_min, timeframe=bt.TimeFrame.Days)
+    cerebro.resampledata(data_minute, timeframe=bt.TimeFrame.Days)
 
     cerebro.broker.setcash(100000.0)  # Set initial cash
     cerebro.broker.setcommission(commission=0.001)  # Set commission
