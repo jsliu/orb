@@ -9,8 +9,7 @@ import asyncio
 import nest_asyncio
 import logging
 from backtesting import Backtest, Strategy
-from backtesting.test import SMA
-from IPython.display import display, HTML  # Add this import
+from backtesting.lib import resample_apply
 
 # Ensure plots are displayed inline in Jupyter
 # %matplotlib inline
@@ -59,11 +58,35 @@ async def fetch_historical_data(ticker, duration, bar_size):
     df = df[['Open', 'High', 'Low', 'Close', 'Volume']]  # Ensure the DataFrame has the required columns
     return df
 
+# ADV function
+def ADV(data, period=14):
+    return data[data>0].rolling(window=period).mean()
+
+# RVol function
+def RVol(data, period=14):
+    return data[data>0]/data[data>0].rolling(window=period).std()
+
+# Average True Range (ATR) function
+def ATR(data, period=14):
+    high = data['High']
+    low = data['Low']
+    close = data['Close']
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    # need to shift the result by 1 to align with the data
+    return atr
+
 # Define the ORBStrategy class
 class ORBStrategy(Strategy):
-    opening_range_minutes = 5
+    opening_period = 5
     atr_multiplier = 0.1
-    atr_period_days = 14
+    roll_period_days = 14
+    min_adv = 500_000
+    min_atr = 0.3
+    min_rvol = 1
 
     def init(self):
         self.first_bar = None
@@ -75,15 +98,14 @@ class ORBStrategy(Strategy):
         self.sell_signal = False
         self.previous_day = None
 
-        # Add ATR indicator based on resampled daily data
-        self.atr = self.I(SMA, self.data.Close, self.atr_period_days)
+        # Use resample_apply to calculate ATR and ADV
+        self.atr = resample_apply('D', ATR, self.data.df, period=self.roll_period_days)
+        self.adv = resample_apply('D', ADV, self.data.df.Volume, period=self.roll_period_days)
+        self.rvol = resample_apply('D', RVol, self.data.df.Volume, period=self.roll_period_days)
 
     def next(self):
         # Log the current data values
         logging.debug(f"Date: {self.data.index[-1]}, Open: {self.data.Open[-1]}, High: {self.data.High[-1]}, Low: {self.data.Low[-1]}, Close: {self.data.Close[-1]}, Volume: {self.data.Volume[-1]}")
-
-        if len(self.data) < self.atr_period_days:
-            return 
         
         current_date = self.data.index[-1].date()
 
@@ -91,8 +113,11 @@ class ORBStrategy(Strategy):
         if self.previous_day != current_date:
             self.previous_day = current_date
             self.first_range_bar = []
+            self.first_bar = True
+            self.buy_signal = False
+            self.sell_signal = False
 
-        if len(self.first_range_bar) < self.opening_range_minutes:
+        if len(self.first_range_bar) < self.opening_period:
             self.first_range_bar.append({
                 'open': self.data.Open[-1],
                 'high': self.data.High[-1],
@@ -100,38 +125,27 @@ class ORBStrategy(Strategy):
                 'close': self.data.Close[-1],
                 })
 
-        if len(self.first_range_bar) == self.opening_range_minutes:
+        if self.first_bar and len(self.first_range_bar) == self.opening_period:
             self.first_bar_open = self.first_range_bar[0]['open']
             self.first_bar_close = self.first_range_bar[-1]['close']
             self.first_bar_high = max([x['high'] for x in self.first_range_bar])
             self.first_bar_low = min([x['low'] for x in self.first_range_bar])
 
-            self.first_bar = True
-            self.buy_signal = False
-            self.sell_signal = False
-            
-            if self.first_bar_close > self.first_bar_open:
-                self.buy_signal = True
-            elif self.first_bar_close < self.first_bar_open:
-                self.sell_signal = True        
-
-        # If it's the first 5-minute bar, record the high and low prices
-        if self.first_bar:
             self.first_bar = False
-            self.first_bar_high = self.data.High[-1]
-            self.first_bar_low = self.data.Low[-1]
-            if self.first_bar_close > self.first_bar_open:
-                self.buy_signal = True  
-            elif self.first_bar_close < self.first_bar_open:
-                self.sell_signal = True
+            
+            if self.atr[-1] > self.min_atr and self.rvol[-1] > self.min_rvol and self.adv[-1] > self.min_adv:
+                if self.first_bar_close > self.first_bar_open:
+                    self.buy_signal = True
+                elif self.first_bar_close < self.first_bar_open:
+                    self.sell_signal = True        
 
-        # Monitor prices throughout the day
-        if self.buy_signal and self.data.High[-1] > self.first_bar_high:
+        # If it's the first bar, record the high and low prices
+        if self.buy_signal and self.data.Open[-1] > self.first_bar_high:
             self.buy(size=10)  # Buy 100 shares
             self.buy_signal = False
             self.stop_loss = self.data.Close[-1] - self.atr[-1] * self.atr_multiplier
-        
-        if self.sell_signal and self.data.Low[-1] < self.first_bar_low:
+            
+        if self.sell_signal and self.data.Open[-1] < self.first_bar_low:
             self.sell(size=10)  # Sell 100 shares
             self.sell_signal = False
             self.stop_loss = self.data.Close[-1] + self.atr[-1] * self.atr_multiplier
@@ -144,10 +158,13 @@ class ORBStrategy(Strategy):
                 self.position.close()  # Close the position
 
         # Close positions at the end of the trading day
-        market_close_time = pd.to_datetime('15:59:00').time()
+        bar_size_minutes = (self.data.index[1] - self.data.index[0]).seconds // 60
+        # Close positions 2 bar size minutes before the market closes, because it closes after the last bar
+        market_close_time = (pd.to_datetime('16:00:00') - pd.Timedelta(minutes=2 * bar_size_minutes)).time()
         if self.data.index[-1].time() >= market_close_time:
             if self.position:
                 self.position.close()
+
 
 # Function to plot performance using Seaborn
 def plot_performance(portfolio_values):
@@ -169,15 +186,16 @@ def plot_performance(portfolio_values):
     plt.show()
 
 # Function to run the backtest
-def run_backtest(ticker, cash=100000):
-    # Fetch historical data for 1-minute bars
-    df_minute = asyncio.run(fetch_historical_data(ticker, '30 D', '1 min'))
+def run_backtest(ticker, bar_size='1 min', cash=100000, commission=.001, opening_period=5):
+    # Fetch historical data for the specified bar size
+    df_minute = asyncio.run(fetch_historical_data(ticker, '30 D', bar_size=bar_size))
     
     # Align the data to start at the correct time
     # df_minute = df_minute[df_minute.index.time >= pd.to_datetime('09:30:00').time()]
     
     # Run the backtest
-    bt = Backtest(df_minute, ORBStrategy, cash=cash, commission=.001)
+    bt = Backtest(df_minute, ORBStrategy, cash=cash, commission=commission)
+    ORBStrategy.opening_period = opening_period
     stats = bt.run()
     
     # Plot the results
@@ -192,6 +210,7 @@ def run_backtest(ticker, cash=100000):
 
 # Main entry point
 if __name__ == '__main__':
-    stats = run_backtest('ABNB', cash=20000)
+    stats = run_backtest('MMM', bar_size='1 min', cash=20000, opening_period=5)
+    print(stats)
 
 # %%
